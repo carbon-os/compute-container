@@ -64,6 +64,9 @@ c.Shell()
 during development. It exposes the full API surface as subcommands.
 
 ```
+cd cmd/cli
+go build -o container-cli.exe .
+
 container-cli run    --base <path> --scratch <path> -- <cmd>
 container-cli exec   --base <path> --scratch <path> -- <cmd>
 container-cli shell  --base <path> --scratch <path>

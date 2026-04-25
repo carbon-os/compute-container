@@ -6,8 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
-
+	"github.com/sirupsen/logrus"
 	compute_container "github.com/carbon-os/compute-container"
 )
 
@@ -29,6 +28,10 @@ Commands:
   cp-out <ctr-path>  <host-path>   Copy a file from container to host
 `
 
+func init() {
+	logrus.SetOutput(io.Discard)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
@@ -42,10 +45,10 @@ func main() {
 	base := fs.String("base", "", "Base layer path (required)")
 	scratch := fs.String("scratch", "", "Scratch layer path (required)")
 
-	flagArgs, positional := splitArgs(rest)
-	if err := fs.Parse(flagArgs); err != nil {
+	if err := fs.Parse(rest); err != nil {
 		fatalf("%v", err)
 	}
+	positional := fs.Args()
 
 	if *base == "" || *scratch == "" {
 		fmt.Fprintln(os.Stderr, "error: --base and --scratch are required")
@@ -153,24 +156,4 @@ func requireArgs(cmd string, args []string, n int) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
 	os.Exit(1)
-}
-
-// splitArgs splits a flat arg list into flag args and positional args.
-// Anything after a bare "--" is positional; anything starting with "-" before
-// it is a flag; everything else is positional.
-func splitArgs(args []string) (flags, positional []string) {
-	pastSep := false
-	for _, a := range args {
-		switch {
-		case pastSep:
-			positional = append(positional, a)
-		case a == "--":
-			pastSep = true
-		case strings.HasPrefix(a, "-"):
-			flags = append(flags, a)
-		default:
-			positional = append(positional, a)
-		}
-	}
-	return
 }

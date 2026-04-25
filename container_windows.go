@@ -6,28 +6,24 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Microsoft/hcsshim"
 )
 
-// winContainer is the Windows/HCS implementation of containerPlatform.
 type winContainer struct {
 	hc          hcsshim.Container
 	di          hcsshim.DriverInfo
-	baseLayerID string // directory name of the base layer, used for Prepare/Unprepare
-	scratch     string // absolute path to the scratch (writable) layer directory
+	baseLayerID string
+	scratch     string
 
-	mu sync.Mutex // serialises CreateProcess calls
-
-	// keepProc is a long-running cmd.exe whose stdin we hold open so that
-	// the container does not exit when there are no other active processes.
+	mu        sync.Mutex
 	keepProc  hcsshim.Process
 	keepStdin io.WriteCloser
 }
 
-// newPlatformContainer is the Windows factory wired into NewContainer.
 func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 	baseLayer, err := filepath.Abs(mount.BaseLayer)
 	if err != nil {
@@ -39,15 +35,20 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 	}
 
 	di := hcsshim.DriverInfo{
-		Flavour: 1, // windowsfilter
+		Flavour: 1,
 		HomeDir: filepath.Dir(baseLayer),
 	}
 	baseLayerID := filepath.Base(baseLayer)
 
-	// PrepareLayer activates the layer in the HCS filter driver.
-	// It may already be prepared from a prior run; treat that as non-fatal.
+	// Terminate any previously leaked containers that are still holding the
+	// scratch layer open. Without this, a crashed or unclean prior run leaves
+	// the scratch locked and CreateContainer fails with "file in use".
+	if err := terminateStaleContainers(scratch); err != nil {
+		return nil, fmt.Errorf("compute-container: cleanup stale containers: %w", err)
+	}
+
 	if err := hcsshim.PrepareLayer(di, baseLayerID, nil); err != nil {
-		_ = err // best-effort; CreateContainer will fail if truly broken
+		_ = err // may already be prepared; CreateContainer will surface real failures
 	}
 
 	name := fmt.Sprintf("carbon-%d", time.Now().UnixNano())
@@ -93,8 +94,36 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 	return wc, nil
 }
 
-// startKeepalive spawns a cmd.exe whose stdin pipe we keep open indefinitely.
-// As long as this process is alive the container will not auto-exit.
+// terminateStaleContainers finds any running HCS containers whose scratch
+// (LayerFolderPath) matches ours and forcefully terminates them. This recovers
+// from a prior unclean exit that left the scratch layer locked.
+func terminateStaleContainers(scratchPath string) error {
+	q := hcsshim.ComputeSystemQuery{
+		Types:  []string{"Container"},
+		Owners: []string{"carbon-compute"},
+	}
+	infos, err := hcsshim.GetContainers(q)
+	if err != nil {
+		// GetContainers failing is non-fatal; we'll let CreateContainer
+		// surface the real error if the scratch is still locked.
+		return nil
+	}
+
+	for _, info := range infos {
+		if !strings.EqualFold(info.RuntimeImagePath, scratchPath) {
+			continue
+		}
+		c, err := hcsshim.OpenContainer(info.ID)
+		if err != nil {
+			continue
+		}
+		_ = c.Terminate()
+		_ = c.Close()
+	}
+
+	return nil
+}
+
 func (wc *winContainer) startKeepalive() error {
 	proc, err := wc.hc.CreateProcess(&hcsshim.ProcessConfig{
 		ApplicationName:  `C:\Windows\System32\cmd.exe`,
