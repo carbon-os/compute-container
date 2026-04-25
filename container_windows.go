@@ -40,9 +40,6 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 	}
 	baseLayerID := filepath.Base(baseLayer)
 
-	// Terminate any previously leaked containers that are still holding the
-	// scratch layer open. Without this, a crashed or unclean prior run leaves
-	// the scratch locked and CreateContainer fails with "file in use".
 	if err := terminateStaleContainers(scratch); err != nil {
 		return nil, fmt.Errorf("compute-container: cleanup stale containers: %w", err)
 	}
@@ -65,7 +62,7 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 		},
 	}
 
-	hc, err := hcsshim.CreateContainer(name, &cfg)
+	hc, err := createContainerWithRetry(name, &cfg, scratch, di, baseLayerID)
 	if err != nil {
 		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: create container: %w", err)
@@ -95,17 +92,17 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 }
 
 // terminateStaleContainers finds any running HCS containers whose scratch
-// (LayerFolderPath) matches ours and forcefully terminates them. This recovers
-// from a prior unclean exit that left the scratch layer locked.
+// (LayerFolderPath) matches ours and forcefully terminates them. The Owners
+// filter is intentionally omitted so we catch containers started under any
+// owner name from a previous build or unclean exit.
 func terminateStaleContainers(scratchPath string) error {
 	q := hcsshim.ComputeSystemQuery{
-		Types:  []string{"Container"},
-		Owners: []string{"carbon-compute"},
+		Types: []string{"Container"},
 	}
 	infos, err := hcsshim.GetContainers(q)
 	if err != nil {
-		// GetContainers failing is non-fatal; we'll let CreateContainer
-		// surface the real error if the scratch is still locked.
+		// Non-fatal; CreateContainer will surface the real error if the
+		// scratch is still locked.
 		return nil
 	}
 
@@ -122,6 +119,26 @@ func terminateStaleContainers(scratchPath string) error {
 	}
 
 	return nil
+}
+
+// createContainerWithRetry calls hcsshim.CreateContainer and, if the scratch
+// layer is still locked from a prior run, performs a broader stale-container
+// sweep, waits briefly for HCS to release the layer, then retries once.
+func createContainerWithRetry(name string, cfg *hcsshim.ContainerConfig, scratch string, di hcsshim.DriverInfo, baseLayerID string) (hcsshim.Container, error) {
+	hc, err := hcsshim.CreateContainer(name, cfg)
+	if err == nil {
+		return hc, nil
+	}
+
+	if !strings.Contains(err.Error(), "being used by another process") {
+		return nil, err
+	}
+
+	_ = terminateStaleContainers(scratch)
+	time.Sleep(500 * time.Millisecond)
+
+	hc, err = hcsshim.CreateContainer(name, cfg)
+	return hc, err
 }
 
 func (wc *winContainer) startKeepalive() error {

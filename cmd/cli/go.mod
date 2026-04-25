@@ -2,7 +2,10 @@ module app
 
 go 1.26.2
 
-require github.com/carbon-os/compute-container v0.0.0-20260425033836-1fc085922b7c
+require (
+	github.com/carbon-os/compute-container v0.0.0-20260425033836-1fc085922b7c
+	github.com/sirupsen/logrus v1.9.4
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -14,7 +17,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250218202821-56aae31c358a // indirect

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"io"
 	"github.com/sirupsen/logrus"
 	compute_container "github.com/carbon-os/compute-container"
 )
