@@ -18,6 +18,7 @@ type winContainer struct {
 	di          hcsshim.DriverInfo
 	baseLayerID string
 	scratch     string
+	endpointID  string
 
 	mu        sync.Mutex
 	keepProc  hcsshim.Process
@@ -45,7 +46,13 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 	}
 
 	if err := hcsshim.PrepareLayer(di, baseLayerID, nil); err != nil {
-		_ = err // may already be prepared; CreateContainer will surface real failures
+		_ = err
+	}
+
+	endpointID, err := setupNetwork(mount.Network)
+	if err != nil {
+		_ = hcsshim.UnprepareLayer(di, baseLayerID)
+		return nil, err
 	}
 
 	name := fmt.Sprintf("carbon-%d", time.Now().UnixNano())
@@ -60,18 +67,30 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 				Path: baseLayer,
 			},
 		},
+		// No EndpointList here — we hot-attach after Start()
 	}
 
 	hc, err := createContainerWithRetry(name, &cfg, scratch, di, baseLayerID)
 	if err != nil {
+		teardownEndpoint(endpointID)
 		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: create container: %w", err)
 	}
 
 	if err := hc.Start(); err != nil {
 		_ = hc.Close()
+		teardownEndpoint(endpointID)
 		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: start container: %w", err)
+	}
+
+	// Hot-attach the network endpoint now that the container is running.
+	if err := attachEndpoint(name, endpointID); err != nil {
+		_ = hc.Terminate()
+		_ = hc.Close()
+		teardownEndpoint(endpointID)
+		_ = hcsshim.UnprepareLayer(di, baseLayerID)
+		return nil, err
 	}
 
 	wc := &winContainer{
@@ -79,11 +98,13 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 		di:          di,
 		baseLayerID: baseLayerID,
 		scratch:     scratch,
+		endpointID:  endpointID,
 	}
 
 	if err := wc.startKeepalive(); err != nil {
 		_ = hc.Terminate()
 		_ = hc.Close()
+		teardownEndpoint(endpointID)
 		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: keepalive: %w", err)
 	}
@@ -91,23 +112,18 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 	return wc, nil
 }
 
-// terminateStaleContainers finds any running HCS containers whose scratch
-// (LayerFolderPath) matches ours and forcefully terminates them. The Owners
-// filter is intentionally omitted so we catch containers started under any
-// owner name from a previous build or unclean exit.
 func terminateStaleContainers(scratchPath string) error {
 	q := hcsshim.ComputeSystemQuery{
 		Types: []string{"Container"},
 	}
 	infos, err := hcsshim.GetContainers(q)
 	if err != nil {
-		// Non-fatal; CreateContainer will surface the real error if the
-		// scratch is still locked.
 		return nil
 	}
 
 	for _, info := range infos {
-		if !strings.EqualFold(info.RuntimeImagePath, scratchPath) {
+		if !strings.HasPrefix(info.ID, "carbon-") &&
+			!strings.HasPrefix(info.Name, "carbon-") {
 			continue
 		}
 		c, err := hcsshim.OpenContainer(info.ID)
@@ -121,9 +137,6 @@ func terminateStaleContainers(scratchPath string) error {
 	return nil
 }
 
-// createContainerWithRetry calls hcsshim.CreateContainer and, if the scratch
-// layer is still locked from a prior run, performs a broader stale-container
-// sweep, waits briefly for HCS to release the layer, then retries once.
 func createContainerWithRetry(name string, cfg *hcsshim.ContainerConfig, scratch string, di hcsshim.DriverInfo, baseLayerID string) (hcsshim.Container, error) {
 	hc, err := hcsshim.CreateContainer(name, cfg)
 	if err == nil {
@@ -135,7 +148,7 @@ func createContainerWithRetry(name string, cfg *hcsshim.ContainerConfig, scratch
 	}
 
 	_ = terminateStaleContainers(scratch)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 
 	hc, err = hcsshim.CreateContainer(name, cfg)
 	return hc, err
@@ -183,6 +196,7 @@ func (wc *winContainer) close() error {
 		_ = wc.hc.Terminate()
 	}
 	_ = wc.hc.Close()
+	teardownEndpoint(wc.endpointID)
 	_ = hcsshim.UnprepareLayer(wc.di, wc.baseLayerID)
 	return nil
 }

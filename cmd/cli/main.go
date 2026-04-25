@@ -5,8 +5,9 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 	"io"
+	"os"
+
 	"github.com/sirupsen/logrus"
 	compute_container "github.com/carbon-os/compute-container"
 )
@@ -14,7 +15,7 @@ import (
 const usage = `container-cli — Carbon Compute Container CLI
 
 Usage:
-  container-cli <command> --base <path> --scratch <path> [options]
+  container-cli <command> --base <path> --scratch <path> [--network <name>] [options]
 
 Commands:
   run    -- <cmd...>               Run a command with host stdio attached
@@ -27,6 +28,11 @@ Commands:
   rmdir  <container-path>          Delete a directory and its contents
   cp-in  <host-path> <ctr-path>    Copy a file from host into container
   cp-out <ctr-path>  <host-path>   Copy a file from container to host
+
+Networking:
+  --network <name>   Attach the container to an HNS network (e.g. "nat").
+                     To list available networks run:
+                       Get-HnsNetwork | Select Name
 `
 
 func init() {
@@ -43,8 +49,9 @@ func main() {
 	rest := os.Args[2:]
 
 	fs := flag.NewFlagSet(subcmd, flag.ExitOnError)
-	base := fs.String("base", "", "Base layer path (required)")
+	base    := fs.String("base", "", "Base layer path (required)")
 	scratch := fs.String("scratch", "", "Scratch layer path (required)")
+	network := fs.String("network", "", `HNS network name to attach (e.g. "nat")`)
 
 	if err := fs.Parse(rest); err != nil {
 		fatalf("%v", err)
@@ -60,6 +67,7 @@ func main() {
 	c, err := compute_container.NewContainer(compute_container.ImageMount{
 		BaseLayer: *base,
 		Scratch:   *scratch,
+		Network:   *network,
 	})
 	if err != nil {
 		fatalf("open container: %v", err)
