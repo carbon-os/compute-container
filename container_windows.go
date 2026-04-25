@@ -3,8 +3,10 @@
 package compute_container
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -14,11 +16,9 @@ import (
 )
 
 type winContainer struct {
-	hc          hcsshim.Container
-	di          hcsshim.DriverInfo
-	baseLayerID string
-	scratch     string
-	endpointID  string
+	hc         hcsshim.Container
+	scratch    string
+	endpointID string
 
 	mu        sync.Mutex
 	keepProc  hcsshim.Process
@@ -26,32 +26,37 @@ type winContainer struct {
 }
 
 func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
-	baseLayer, err := filepath.Abs(mount.BaseLayer)
-	if err != nil {
-		return nil, fmt.Errorf("compute-container: resolve base layer: %w", err)
-	}
 	scratch, err := filepath.Abs(mount.Scratch)
 	if err != nil {
 		return nil, fmt.Errorf("compute-container: resolve scratch: %w", err)
 	}
 
-	di := hcsshim.DriverInfo{
-		Flavour: 1,
-		HomeDir: filepath.Dir(baseLayer),
+	// 1. Read the layerchain.json to get the exact parent layer order (Newest-to-Oldest)
+	chainBytes, err := os.ReadFile(filepath.Join(scratch, "layerchain.json"))
+	if err != nil {
+		return nil, fmt.Errorf("compute-container: read layerchain.json: %w", err)
 	}
-	baseLayerID := filepath.Base(baseLayer)
+	var parentChain []string
+	if err := json.Unmarshal(chainBytes, &parentChain); err != nil {
+		return nil, fmt.Errorf("compute-container: parse layerchain.json: %w", err)
+	}
+
+	// 2. Map the parent paths into HCS Layer structs
+	// FIX: Revert to standard forward iteration! hcsshim natively expects Newest-to-Oldest.
+	var layers []hcsshim.Layer
+	for _, p := range parentChain {
+		layers = append(layers, hcsshim.Layer{
+			ID:   hcsshim.NewGUID(filepath.Base(p)).ToString(),
+			Path: p,
+		})
+	}
 
 	if err := terminateStaleContainers(scratch); err != nil {
 		return nil, fmt.Errorf("compute-container: cleanup stale containers: %w", err)
 	}
 
-	if err := hcsshim.PrepareLayer(di, baseLayerID, nil); err != nil {
-		_ = err
-	}
-
 	endpointID, err := setupNetwork(mount.Network)
 	if err != nil {
-		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, err
 	}
 
@@ -61,26 +66,29 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 		Name:            name,
 		Owner:           "carbon-compute",
 		LayerFolderPath: scratch,
-		Layers: []hcsshim.Layer{
-			{
-				ID:   hcsshim.NewGUID(baseLayerID).ToString(),
-				Path: baseLayer,
-			},
-		},
-		// No EndpointList here — we hot-attach after Start()
+		Layers:          layers, // Newest-to-Oldest
 	}
 
-	hc, err := createContainerWithRetry(name, &cfg, scratch, di, baseLayerID)
+	// FIX: If Hyper-V isolation is requested, tell HCS to spin up the Utility VM.
+	// The UtilityVM kernel lives in the Base OS layer, which is the OLDEST layer
+	// (the last element in our Newest-to-Oldest array).
+	if mount.HyperV {
+		baseLayer := layers[len(layers)-1].Path
+		cfg.HvPartition = true
+		cfg.HvRuntime = &hcsshim.HvRuntime{
+			ImagePath: filepath.Join(baseLayer, "UtilityVM"),
+		}
+	}
+
+	hc, err := createContainerWithRetry(name, &cfg, scratch)
 	if err != nil {
 		teardownEndpoint(endpointID)
-		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: create container: %w", err)
 	}
 
 	if err := hc.Start(); err != nil {
 		_ = hc.Close()
 		teardownEndpoint(endpointID)
-		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: start container: %w", err)
 	}
 
@@ -89,23 +97,19 @@ func newPlatformContainer(mount ImageMount) (containerPlatform, error) {
 		_ = hc.Terminate()
 		_ = hc.Close()
 		teardownEndpoint(endpointID)
-		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, err
 	}
 
 	wc := &winContainer{
-		hc:          hc,
-		di:          di,
-		baseLayerID: baseLayerID,
-		scratch:     scratch,
-		endpointID:  endpointID,
+		hc:         hc,
+		scratch:    scratch,
+		endpointID: endpointID,
 	}
 
 	if err := wc.startKeepalive(); err != nil {
 		_ = hc.Terminate()
 		_ = hc.Close()
 		teardownEndpoint(endpointID)
-		_ = hcsshim.UnprepareLayer(di, baseLayerID)
 		return nil, fmt.Errorf("compute-container: keepalive: %w", err)
 	}
 
@@ -137,7 +141,7 @@ func terminateStaleContainers(scratchPath string) error {
 	return nil
 }
 
-func createContainerWithRetry(name string, cfg *hcsshim.ContainerConfig, scratch string, di hcsshim.DriverInfo, baseLayerID string) (hcsshim.Container, error) {
+func createContainerWithRetry(name string, cfg *hcsshim.ContainerConfig, scratch string) (hcsshim.Container, error) {
 	hc, err := hcsshim.CreateContainer(name, cfg)
 	if err == nil {
 		return hc, nil
@@ -197,6 +201,5 @@ func (wc *winContainer) close() error {
 	}
 	_ = wc.hc.Close()
 	teardownEndpoint(wc.endpointID)
-	_ = hcsshim.UnprepareLayer(wc.di, wc.baseLayerID)
 	return nil
 }

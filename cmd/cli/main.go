@@ -7,32 +7,36 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
-	"github.com/sirupsen/logrus"
 	compute_container "github.com/carbon-os/compute-container"
+	"github.com/sirupsen/logrus"
 )
 
 const usage = `container-cli — Carbon Compute Container CLI
 
 Usage:
-  container-cli <command> --base <path> --scratch <path> [--network <name>] [options]
+  container-cli <command> <image> [--network <name>] [--hyperv] [options]
 
 Commands:
-  run    -- <cmd...>               Run a command with host stdio attached
-  exec   -- <cmd...>               Run a command and capture output
-  shell                            Open an interactive shell
-  ls     <container-path>          List directory contents
-  cat    <container-path>          Print file contents to stdout
-  mkdir  <container-path>          Create a directory (parents included)
-  rm     <container-path>          Delete a file
-  rmdir  <container-path>          Delete a directory and its contents
-  cp-in  <host-path> <ctr-path>    Copy a file from host into container
-  cp-out <ctr-path>  <host-path>   Copy a file from container to host
+  run    <image> -- <cmd...>               Run a command with host stdio attached
+  exec   <image> -- <cmd...>               Run a command and capture output
+  shell  <image>                           Open an interactive shell
+  ls     <image> <container-path>          List directory contents
+  cat    <image> <container-path>          Print file contents to stdout
+  mkdir  <image> <container-path>          Create a directory (parents included)
+  rm     <image> <container-path>          Delete a file
+  rmdir  <image> <container-path>          Delete a directory and its contents
+  cp-in  <image> <host-path> <ctr-path>    Copy a file from host into container
+  cp-out <image> <ctr-path>  <host-path>   Copy a file from container to host
 
-Networking:
+Options:
   --network <name>   Attach the container to an HNS network (e.g. "nat").
-                     To list available networks run:
-                       Get-HnsNetwork | Select Name
+  --hyperv           Use Hyper-V isolation (required if container OS != host OS).
+
+Examples:
+  container-cli shell mcr.microsoft.com/windows/servercore:ltsc2022 --network nat --hyperv
 `
 
 func init() {
@@ -40,34 +44,30 @@ func init() {
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	if len(os.Args) < 3 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
 	}
 
 	subcmd := os.Args[1]
-	rest := os.Args[2:]
+	imageRef := os.Args[2]
+	rest := os.Args[3:]
 
 	fs := flag.NewFlagSet(subcmd, flag.ExitOnError)
-	base    := fs.String("base", "", "Base layer path (required)")
-	scratch := fs.String("scratch", "", "Scratch layer path (required)")
 	network := fs.String("network", "", `HNS network name to attach (e.g. "nat")`)
+	hyperv := fs.Bool("hyperv", false, `Use Hyper-V isolation (required for OS mismatch)`)
 
 	if err := fs.Parse(rest); err != nil {
 		fatalf("%v", err)
 	}
 	positional := fs.Args()
 
-	if *base == "" || *scratch == "" {
-		fmt.Fprintln(os.Stderr, "error: --base and --scratch are required")
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(1)
-	}
+	scratch := resolveScratchPath(imageRef)
 
 	c, err := compute_container.NewContainer(compute_container.ImageMount{
-		BaseLayer: *base,
-		Scratch:   *scratch,
-		Network:   *network,
+		Scratch: scratch,
+		Network: *network,
+		HyperV:  *hyperv,
 	})
 	if err != nil {
 		fatalf("open container: %v", err)
@@ -165,4 +165,28 @@ func requireArgs(cmd string, args []string, n int) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// resolveScratchPath predicts the local AppData directory structure mapped by compute-image.
+func resolveScratchPath(image string) string {
+	tag := "latest"
+	if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
+		tag = image[i+1:]
+		image = image[:i]
+	}
+	var registry, repo string
+	parts := strings.SplitN(image, "/", 2)
+	if len(parts) == 2 && strings.ContainsAny(parts[0], ".:") {
+		registry = parts[0]
+		repo = parts[1]
+	} else {
+		registry = "index.docker.io"
+		repo = image
+	}
+
+	local := os.Getenv("LOCALAPPDATA")
+	if local == "" {
+		local = "."
+	}
+	return filepath.Join(local, "carbon", registry, filepath.FromSlash(repo), tag, "scratch")
 }
